@@ -1,0 +1,2 @@
+FROM busybox
+CMD /bin/sh -c 'mkdir -p /consul/config /consul/data && [ -r /consul/config/consul.json ] || echo "{ \"ports\": {\"dns\":8600} }" > /consul/config/consul.json && chmod -R 777 /consul && while [ 1 ] ; do sleep 86400 ; done'

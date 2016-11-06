@@ -1,0 +1,124 @@
+#!/bin/sh
+set -e
+CONSUL_VERSION=v0.6.4
+REGISTRATOR_VERSION=v7
+DOMAIN_NAME=${DOMAIN_NAME:-${USER}}
+
+function create_docker_host() {
+  NAME=$1
+  OPTIONS=$2
+  MEM=${3:-2048}
+  CPU=${4:-2}
+  DISK=${5:-100000}
+  if [ ! -d "${HOME}/.docker/machine/machines/${NAME}" ] ; then
+    docker-machine create --driver virtualbox \
+                          --virtualbox-memory ${MEM} \
+                          --virtualbox-cpu-count ${CPU} \
+                          --virtualbox-disk-size ${DISK} \
+                          ${OPTIONS}  ${NAME} 2>&1 2>&1 | awk -F'\n' '{print "\t"$1}'
+  fi
+  eval "$(docker-machine env ${NAME})"
+  ADDRESS=$(docker-machine ip ${NAME})
+}
+
+function clean() {
+  set +e
+  docker rm -f $* >& /dev/null
+  set -e  
+}
+
+function consul() {
+  NAME=$1
+  OPTIONS="--engine-label 'role=consul'"
+  create_docker_host $NAME "$OPTIONS" 512 2 6000
+  docker build -t hbouvier/consul-data-only -f Dockerfile-data-only .  2>&1 | awk -F'\n' '{print "\t"$1}'
+  clean  consul consul-data-only
+  docker run --name consul-data-only -d --restart=always -v /consul/data -v /consul/data -v /consul/config hbouvier/consul-data-only 2>&1 | awk -F'\n' '{print "\t"$1}'
+  docker run --name consul -d \
+             -h consul \
+             --restart=always \
+             --net host \
+             --volumes-from consul-data-only \
+             consul:${CONSUL_VERSION} agent -server -domain ${DOMAIN_NAME} -recursor 8.8.8.8 -recursor 8.8.4.4 -bind 0.0.0.0 -client 0.0.0.0 -advertise ${ADDRESS} -dc dev -node consul -data-dir /consul/data -config-dir /consul/config -bootstrap-expect 1 -ui 2>&1 | awk -F'\n' '{print "\t"$1}'
+  echo "[OK] ${NAME} on ${ADDRESS}"
+}
+
+function swarm() {
+  NAME=$1
+  CONSUL_ADDRESS=$(docker-machine ip consul)
+  OPTIONS="--engine-label 'role=swarm-master' \
+           --swarm \
+           --swarm-master \
+           --swarm-discovery consul://${CONSUL_ADDRESS}:8500 \
+           --engine-opt 'cluster-store=consul://${CONSUL_ADDRESS}:8500' \
+           --engine-opt 'cluster-advertise=eth1:2376'"
+  create_docker_host $NAME "$OPTIONS" 512 2 6000
+  echo "[OK] ${NAME} on ${ADDRESS}"
+}
+
+function node() {
+  NAME=$1
+  SWARM_ADDRESS=$(docker-machine ip swarm)
+  CONSUL_ADDRESS=$(docker-machine ip consul)
+  OPTIONS="--engine-label 'role=swarm-slave' \
+           --swarm \
+           --swarm-discovery consul://${CONSUL_ADDRESS}:8500 \
+           --engine-opt 'cluster-store=consul://${CONSUL_ADDRESS}:8500' \
+           --engine-opt 'cluster-advertise=eth1:2376'"
+  create_docker_host $NAME "$OPTIONS"
+  clean registrator swarm-agent consul-agent
+
+  docker run --name consul-agent -d \
+             --restart=always --net host -h ${NAME} \
+             consul:${CONSUL_VERSION} \
+             agent -domain ${DOMAIN_NAME} \
+             -recursor 8.8.8.8 -recursor 8.8.4.4 \
+             -bind 0.0.0.0 -client 0.0.0.0 \
+             -advertise ${ADDRESS} -dc dev \
+             -join ${CONSUL_ADDRESS} 2>&1 | awk -F'\n' '{print "\t"$1}'
+
+  docker run --name swarm-agent -d \
+             --restart=always \
+             --net=host \
+             swarm join -advertise=${ADDRESS}:2376 consul://${CONSUL_ADDRESS}:8500 2>&1 | awk -F'\n' '{print "\t"$1}'
+
+  docker run --name registrator -d \
+             --restart=always \
+             --net=host \
+             --volume=/var/run/docker.sock:/tmp/docker.sock \
+             gliderlabs/registrator:${REGISTRATOR_VERSION} -ip ${ADDRESS} consul://127.0.0.1:8500 2>&1 | awk -F'\n' '{print "\t"$1}'
+  echo "[OK] node ${NAME} running on ${ADDRESS}"
+}
+
+function slave() {
+  while [ "$1" != "" ] ; do
+    node "$1"
+    shift
+  done
+}
+
+case $1 in
+  "bootstrap")
+    consul "consul"; CONSUL_ADDRESS=${ADDRESS}
+    swarm "swarm"; SWARM_ADDRESS=${ADDRESS}
+    shift
+    slave $*
+    echo "REMEMBER TO RUN THIS IN YOUR TERMINAL:"
+    echo ""
+    echo 'eval "$('$0' env)"'
+    ;;
+  "slave")
+    shift
+    slave $*
+    ;;
+  "env")
+    #printf "export DOCKER_TLS_VERIFY=1\nexport DOCKER_CERT_PATH=${HOME}/.docker/machine/machines/swarm\nDOCKER_HOST=tcp://$(docker-machine ip swarm):3376\nexport DOCKER_MACHINE_NAME=swarm\n"
+    docker-machine env swarm --swarm
+    ;;
+  "help")
+    echo 'eval "$('$0' env)"'
+    ;;
+  *)
+    echo "USAGE: swarm [bootstrap|slave|env] {node-name-1 node-name-2 ...}"
+    ;;
+esac
